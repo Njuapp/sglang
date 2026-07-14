@@ -60,6 +60,13 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _to_2d_context_lens(seqlens_32: torch.Tensor) -> torch.Tensor:
+    """Normalize DeepGEMM context lengths to its ``(num_queries, 1)`` ABI."""
+    if seqlens_32.dim() == 2 and seqlens_32.size(1) == 1:
+        return seqlens_32
+    return seqlens_32.contiguous().view(-1, 1)
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -418,10 +425,15 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        context_lens_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+        if context_lens_2d is None:
+            context_lens_2d = (
+                _to_2d_context_lens(seqlens_32) if _is_cuda else seqlens_32
+            )
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
+                    context_lens_2d, blocksize, self.sm_count
                 )
 
         assert len(q_fp8.shape) == 3
@@ -473,7 +485,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
+                context_lens_2d,
                 block_tables,
                 schedule_metadata,
                 max_seq_len,

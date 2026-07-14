@@ -125,6 +125,47 @@ def flash_mla_with_kvcache(
     return out, softmax_lse
 
 
+def flash_mla_with_kvcache_nvfp4(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    kv_global_scale: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    tile_scheduler_metadata: torch.Tensor,
+    num_splits: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int = 512,
+    softmax_scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run SM90 sparse MLA directly from SGLang's NVFP4 latent cache.
+
+    ``k_cache`` has the fixed layout ``[num_pages, 64, 1, 416]`` in bytes:
+    256 bytes of packed E2M1 latent values, 32 E4M3 block-16 scales, and
+    128 bytes of unscaled BF16 RoPE values per token. ``kv_global_scale`` is a
+    device FP32 scalar and is applied only to the 512 latent dimensions.
+
+    ``indices`` contains physical flattened token indices with shape
+    ``[batch, seq_len_q, topk]``. Negative or positive out-of-capacity entries
+    are ignored. The metadata is produced by :func:`get_mla_metadata` with
+    ``is_fp8_kvcache=True`` and the matching ``topk``; the FP8 flag selects the
+    same sparse SM90 schedule and does not describe this independent cache ABI.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    out, softmax_lse = torch.ops.sgl_kernel.fwd_kvcache_mla_nvfp4.default(
+        q,
+        k_cache,
+        kv_global_scale,
+        head_dim_v,
+        cache_seqlens,
+        softmax_scale,
+        tile_scheduler_metadata,
+        num_splits,
+        indices,
+    )
+    return out, softmax_lse
+
+
 def flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,

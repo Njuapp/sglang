@@ -544,6 +544,32 @@ def get_config(
                     raise
 
     if (
+        getattr(config, "architectures", None) is not None
+        and config.architectures[0] == "GlmMoeDsaForCausalLM"
+    ):
+        # Older transformers GlmMoeDsaConfig versions drop/clobber fields that
+        # the GLM-5.2 NSA runtime needs. Restore their raw config.json values.
+        raw_config, _ = PretrainedConfig.get_config_dict(
+            model,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+        for key in (
+            "qk_rope_head_dim",
+            "index_topk_freq",
+            "index_topk_pattern",
+            "index_skip_topk_offset",
+        ):
+            if key in raw_config:
+                setattr(config, key, raw_config[key])
+        if all(
+            hasattr(config, key)
+            for key in ("qk_head_dim", "qk_nope_head_dim", "qk_rope_head_dim")
+        ):
+            config.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
+
+    if (
         config.architectures is not None
         and config.architectures[0] == "Phi4MMForCausalLM"
     ):

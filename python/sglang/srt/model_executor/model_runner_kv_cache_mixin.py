@@ -9,6 +9,7 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.nsa.nvfp4_k_cache import NVFP4_BYTES_PER_TOKEN
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.kv_cache_quant_method import (
     get_kv_cache_quant_method,
@@ -75,28 +76,37 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
-            cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                cell_size = (cell_size // 2) + (
+            is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+            if is_nsa_model and is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                # NSA NVFP4 stores the latent cache as packed E2M1 values plus
+                # E4M3 block scales, while keeping the RoPE portion in BF16.
+                cell_size = NVFP4_BYTES_PER_TOKEN * num_layers
+            else:
+                cell_size = (
                     (
-                        (
-                            self.model_config.kv_lora_rank
-                            + self.model_config.qk_rope_head_dim
-                        )
-                        // scale_block_size
+                        self.model_config.kv_lora_rank
+                        + self.model_config.qk_rope_head_dim
                     )
                     * num_layers
                     * kv_size
                 )
+                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    # kv_scale_buffer
+                    scale_block_size = 16
+                    cell_size = (cell_size // 2) + (
+                        (
+                            (
+                                self.model_config.kv_lora_rank
+                                + self.model_config.qk_rope_head_dim
+                            )
+                            // scale_block_size
+                        )
+                        * num_layers
+                        * kv_size
+                    )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-            if is_deepseek_nsa(self.model_config.hf_config):
+            if is_nsa_model:
                 index_head_dim = get_nsa_index_head_dim(self.model_config.hf_config)
                 indexer_size_per_token = (
                     index_head_dim
@@ -252,6 +262,9 @@ class ModelRunnerKVCacheMixin:
         if not is_nsa_model:
             return kv_cache_dim
 
+        if is_float4_e2m1fn_x2(kv_cache_dtype):
+            return NVFP4_BYTES_PER_TOKEN
+
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
         # Assuming nsa prefill and decode backends are the same when using trtllm MLA backend,
         # since it is not compatible for trtllm and other mla attn backend due to the different
@@ -379,6 +392,66 @@ class ModelRunnerKVCacheMixin:
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+
+    def _load_nsa_nvfp4_global_scales(self: ModelRunner) -> None:
+        """Initialize NSA NVFP4 per-layer scales from loaded attention weights.
+
+        ModelOpt-style ``attn_mqa.k_scale`` parameters have already been
+        normalized when the KV pool is created. NVFP4 uses that value as its
+        FP32 tensor-wide scale: quantization divides the latent by it and
+        dequantization multiplies by it. Layers without a checkpoint scale
+        intentionally retain 1.0.
+        """
+
+        pool = self.token_to_kv_pool
+        if not getattr(pool, "nsa_kv_cache_store_nvfp4", False):
+            return
+
+        from sglang.srt.model_executor.model_runner import resolve_language_model
+
+        language_model = resolve_language_model(self.model)
+        layers = getattr(language_model, "layers", None)
+        if layers is None:
+            # NextN models expose their single decoder layer directly.
+            decoder = getattr(language_model, "decoder", None)
+            layers = [] if decoder is None else [decoder]
+
+        initialized_layer_ids = set()
+        for model_layer in layers:
+            attention = None
+            if hasattr(model_layer, "self_attn"):
+                self_attn = model_layer.self_attn
+                if hasattr(self_attn, "attn"):
+                    attention = self_attn.attn
+                elif hasattr(self_attn, "attn_mqa"):
+                    attention = self_attn.attn_mqa
+            elif hasattr(model_layer, "attn"):
+                attention = model_layer.attn
+            elif hasattr(model_layer, "attention") and hasattr(
+                model_layer.attention, "attn"
+            ):
+                attention = model_layer.attention.attn
+
+            if attention is None or not hasattr(attention, "layer_id"):
+                continue
+
+            layer_id = attention.layer_id
+            if not self.start_layer <= layer_id < self.end_layer:
+                continue
+
+            scale = getattr(attention, "k_scale_float", None)
+            if scale is None:
+                scale = getattr(attention, "k_scale", None)
+            if scale is None:
+                scale = 1.0
+            pool.set_mla_kv_global_scale(layer_id, scale)
+            initialized_layer_ids.add(layer_id)
+
+        logger.info(
+            "Initialized NSA NVFP4 global scales for %d/%d local layers.",
+            len(initialized_layer_ids),
+            self.num_effective_layers,
+        )
 
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
@@ -569,6 +642,7 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
+                self._load_nsa_nvfp4_global_scales()
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
@@ -669,6 +743,7 @@ class ModelRunnerKVCacheMixin:
                         num_layers=len(hybrid_full_layer_ids),
                         device=self.device,
                         sm_version=sm_version,
+                        native_prefill=self.server_args.enable_nvfp4_native_prefill,
                     )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
@@ -704,6 +779,7 @@ class ModelRunnerKVCacheMixin:
                         num_layers=self.num_effective_layers,
                         device=self.device,
                         sm_version=sm_version,
+                        native_prefill=self.server_args.enable_nvfp4_native_prefill,
                     )
                 self.token_to_kv_pool = MHATokenToKVPool(
                     self.max_total_num_tokens,

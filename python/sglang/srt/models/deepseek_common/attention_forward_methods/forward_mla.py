@@ -14,6 +14,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_mla_deep_gemm_masked_fp8,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.models.deepseek_common.index_cache import should_compute_nsa_indexer
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
     _is_cpu,
@@ -91,6 +92,7 @@ class DeepseekMLAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -182,18 +184,11 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q_lora,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
-                current_stream.wait_stream(self.alt_stream)
-            else:
-                k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-                if q_lora is not None:
+                # Shared GLM-5.2 layers have no usable indexer weights and must
+                # consume the result carried from the preceding layer.
+                if should_compute_nsa_indexer(
+                    self.skip_topk, self.is_nextn, prev_topk_indices
+                ):
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=q_lora,
@@ -201,6 +196,25 @@ class DeepseekMLAForwardMixin:
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,
                     )
+                else:
+                    topk_indices = prev_topk_indices
+                current_stream.wait_stream(self.alt_stream)
+            else:
+                k_nope = k_nope.unsqueeze(1)
+                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if q_lora is not None:
+                    if should_compute_nsa_indexer(
+                        self.skip_topk, self.is_nextn, prev_topk_indices
+                    ):
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=q_lora,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                    else:
+                        topk_indices = prev_topk_indices
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -510,7 +524,12 @@ class DeepseekMLAForwardMixin:
                 )
         output, _ = self.o_proj(attn_bmm_output)
 
-        return output
+        if not self.next_skip_topk:
+            return output
+        # Carry the result only while the following layer is configured to
+        # reuse it. The model loop clears the carried value for ordinary
+        # tensor-only returns.
+        return output, topk_indices
 
     def _fuse_rope_for_trtllm_mla(
         self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch

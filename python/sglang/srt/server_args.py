@@ -328,6 +328,7 @@ class ServerArgs:
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
     fp4_kv_cache_recipe: str = "nvfp4"
+    enable_nvfp4_native_prefill: bool = False
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -1420,10 +1421,19 @@ class ServerArgs:
             )
         if self.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = "bfloat16"
+        if self.kv_cache_dtype == "fp4_e2m1" and self.fp4_kv_cache_recipe != "nvfp4":
+            raise ValueError(
+                "DeepSeek DSA with fp4_e2m1 KV cache only supports "
+                "--fp4-kv-cache-recipe=nvfp4."
+            )
         assert self.kv_cache_dtype in [
             "bfloat16",
             "fp8_e4m3",
-        ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
+            "fp4_e2m1",
+        ], (
+            "DeepSeek DSA only supports bf16/bfloat16, fp8_e4m3, or "
+            "fp4_e2m1 kv_cache_dtype"
+        )
 
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
         user_set_prefill = self.nsa_prefill_backend is not None
@@ -1432,6 +1442,18 @@ class ServerArgs:
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
+        elif kv_cache_dtype == "fp4_e2m1":
+            if major != 9:
+                raise ValueError(
+                    "NSA NVFP4 KV cache currently supports only SM90/Hopper, "
+                    f"got compute capability major {major}."
+                )
+            # Keep the BF16-dequant + FA3 path as the conservative default.
+            # Native NVFP4 FlashMLA decode can be selected explicitly.
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "flashmla_sparse"
+            if not user_set_decode:
+                self.nsa_decode_backend = "fa3"
         elif kv_cache_dtype == "fp8_e4m3":
             if self.dp_size == 1 and major >= 10:
                 self.nsa_prefill_backend = "trtllm"
@@ -1518,6 +1540,24 @@ class ServerArgs:
                 if self.is_attention_backend_not_set():
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
+
+                from sglang.srt.models.deepseek_common.index_cache import (
+                    validate_nsa_index_cache_config,
+                )
+
+                index_share_enabled = validate_nsa_index_cache_config(hf_config)
+                if self.pp_size > 1 and index_share_enabled:
+                    raise ValueError(
+                        "Pipeline parallelism is not supported with NSA "
+                        "index-topk sharing: topk indices are not propagated "
+                        "between pipeline stages."
+                    )
+                if self.enable_two_batch_overlap and index_share_enabled:
+                    raise ValueError(
+                        "--enable-two-batch-overlap is not supported with NSA "
+                        "index-topk sharing: the TBO layer-op path does not "
+                        "propagate topk indices to shared layers."
+                    )
 
                 if not is_npu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
@@ -2438,6 +2478,28 @@ class ServerArgs:
             self.get_attention_backends()
         )
 
+        if self.attention_backend == "nsa":
+            if not is_cuda():
+                raise RuntimeError("NSA NVFP4 KV cache is only supported on CUDA.")
+            if self.enable_hisparse:
+                raise ValueError(
+                    "NSA NVFP4 does not yet support --enable-hisparse because "
+                    "the P0 prefix-dequant path consumes the device cache layout."
+                )
+            if self.fp4_kv_cache_recipe != "nvfp4":
+                raise ValueError(
+                    "NSA with fp4_e2m1 KV cache only supports "
+                    "--fp4-kv-cache-recipe=nvfp4."
+                )
+            if self.nsa_prefill_backend != "flashmla_sparse" or (
+                self.nsa_decode_backend not in {"fa3", "flashmla_kv"}
+            ):
+                raise ValueError(
+                    "NSA NVFP4 requires --nsa-prefill-backend=flashmla_sparse "
+                    "and --nsa-decode-backend in {fa3,flashmla_kv}."
+                )
+            return
+
         if is_cuda():
             if (
                 self.prefill_attention_backend_str != self.decode_attention_backend_str
@@ -2496,12 +2558,16 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                             "trtllm_mha",
+                            # flashinfer: supported via BatchAttention for NVFP4 decode (SM90+)
+                            "flashinfer",
                         ]
-                        assert (
-                            self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
-                        ), (
+                        # Use the effective backend (prefill == decode here)
+                        effective_backend = (
+                            self.attention_backend or self.prefill_attention_backend_str
+                        )
+                        assert effective_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES, (
                             f"KV4 MHA expects attention_backend to be one of "
-                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {self.attention_backend}"
+                            f"{KV4_ATTENTION_MHA_BACKEND_CHOICES}, but got {effective_backend}"
                         )
         else:
             raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
@@ -3815,8 +3881,17 @@ class ServerArgs:
             choices=["nvfp4", "mxfp4"],
             help="FP4 KV cache quantization recipe when --kv-cache-dtype=fp4_e2m1. "
             '"nvfp4" uses two-level scaling (per-tensor FP32 + per-block FP8 E4M3), '
-            "requires SM100/SM120 (Blackwell). "
+            "with SM100/SM120 support for general KV caches and an SM90 path for "
+            "NSA latent caches. "
             '"mxfp4" uses MX block scaling, for other hardware.',
+        )
+        parser.add_argument(
+            "--enable-nvfp4-native-prefill",
+            action="store_true",
+            help="If set, the flashinfer prefill kernel directly consumes NVFP4 KV cache "
+            "without dequantizing to FP8. Requires a flashinfer build with native FP4 "
+            "prefill support. Only effective when --kv-cache-dtype=fp4_e2m1 and "
+            "--fp4-kv-cache-recipe=nvfp4.",
         )
         parser.add_argument(
             "--enable-fp32-lm-head",

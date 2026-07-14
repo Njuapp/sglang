@@ -15,7 +15,13 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
-from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.nsa.nsa_indexer import (
+    BaseIndexerMetadata,
+    _to_2d_context_lens,
+)
+from sglang.srt.layers.attention.nsa.nvfp4_k_cache import (
+    dequantize_nvfp4_k_cache_paged,
+)
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
@@ -62,6 +68,22 @@ if _is_hip:
         )
 else:
     from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+
+def _require_native_nvfp4_flashmla() -> None:
+    """Fail during backend construction if the source-built operator is absent."""
+    try:
+        import sgl_kernel.flash_mla  # noqa: F401
+    except Exception as exc:
+        raise RuntimeError(
+            "Native NSA NVFP4 decode requires a source-built sglang-kernel "
+            "with FlashMLA support."
+        ) from exc
+    if not hasattr(torch.ops.sgl_kernel, "fwd_kvcache_mla_nvfp4"):
+        raise RuntimeError(
+            "sglang-kernel was built without fwd_kvcache_mla_nvfp4; rebuild "
+            "sgl-kernel from the same commit as the SGLang Python package."
+        )
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -125,6 +147,9 @@ class NSAMetadata:
     # DeepGEMM schedule metadata for paged MQA logits (decode/target_verify/draft_extend only).
     # Precomputed once per forward batch and reused across layers.
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    # DeepGEMM requires the context lengths used by both planning and execution
+    # to have the same two-dimensional layout.
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     # The sum of sequence lengths for key, prefill only
     seq_lens_sum: Optional[int] = None
     # The flattened 1D page table with shape (seq_lens_sum,), prefill only
@@ -177,6 +202,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: NSAMetadata
     topk_transform_method: TopkTransformMethod
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
+    paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -305,6 +331,9 @@ class NativeSparseAttnBackend(
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
+        self.nsa_kv_cache_store_nvfp4 = getattr(
+            model_runner.token_to_kv_pool, "nsa_kv_cache_store_nvfp4", False
+        )
         self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
@@ -324,6 +353,8 @@ class NativeSparseAttnBackend(
         )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
+        if self.nsa_kv_cache_store_nvfp4 and self.nsa_decode_impl == "flashmla_kv":
+            _require_native_nvfp4_flashmla()
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
 
@@ -602,12 +633,13 @@ class NativeSparseAttnBackend(
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
 
         paged_mqa_schedule_metadata = None
+        paged_mqa_ctx_lens_2d = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
         # Compute it once per forward batch and reuse it across layers.
         if is_cuda() and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend()
+            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -617,15 +649,17 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend()
+                        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
                     )
                     else cache_seqlens_int32
                 )
+                paged_mqa_ctx_lens_2d = _to_2d_context_lens(seqlens_32)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
+                paged_mqa_ctx_lens_2d = None
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -646,6 +680,7 @@ class NativeSparseAttnBackend(
                 else None
             ),
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -890,10 +925,11 @@ class NativeSparseAttnBackend(
         real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
+        paged_mqa_ctx_lens_2d = None
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
@@ -902,15 +938,17 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
+                        or forward_mode.is_draft_extend(include_v2=True)
                     )
                     else cache_seqlens_int32
                 )
+                paged_mqa_ctx_lens_2d = _to_2d_context_lens(seqlens_32)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
+                paged_mqa_ctx_lens_2d = None
 
         metadata = NSAMetadata(
             page_size=self.real_page_size,
@@ -922,6 +960,7 @@ class NativeSparseAttnBackend(
             page_table_1=page_table_1,
             flashmla_metadata=flashmla_metadata,
             paged_mqa_schedule_metadata=paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=paged_mqa_ctx_lens_2d,
             nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
@@ -1042,28 +1081,37 @@ class NativeSparseAttnBackend(
         if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend()
+            or forward_mode.is_draft_extend(include_v2=True)
         ):
             try:
                 import deep_gemm
 
-                seqlens_32 = (
-                    seqlens_expanded
-                    if (
-                        forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend()
-                    )
-                    else metadata.cache_seqlens_int32
-                )
+                if forward_mode.is_draft_extend_v2():
+                    # Spec-v2 captures a fixed bs * draft_tokens query shape.
+                    # Keep the planner and compute tensor at that fixed shape;
+                    # only the accepted prefix is refreshed above.
+                    seqlens_32 = metadata.nsa_seqlens_expanded
+                elif forward_mode.is_target_verify() or forward_mode.is_draft_extend():
+                    seqlens_32 = seqlens_expanded
+                else:
+                    seqlens_32 = metadata.cache_seqlens_int32
+                seqlens_32_2d = _to_2d_context_lens(seqlens_32)
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
-                    metadata.paged_mqa_schedule_metadata = new_schedule
+                    object.__setattr__(
+                        metadata, "paged_mqa_schedule_metadata", new_schedule
+                    )
                 else:
                     metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                if metadata.paged_mqa_ctx_lens_2d is None:
+                    object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+                else:
+                    metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
             except (ImportError, ModuleNotFoundError):
-                metadata.paged_mqa_schedule_metadata = None
+                object.__setattr__(metadata, "paged_mqa_schedule_metadata", None)
+                object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", None)
         seqlens_expanded_size = seqlens_expanded.shape[0]
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
@@ -1132,7 +1180,7 @@ class NativeSparseAttnBackend(
                     mode_int = 0  # DECODE
                 elif forward_mode.is_target_verify():
                     mode_int = 1  # TARGET_VERIFY
-                elif forward_mode.is_draft_extend():
+                elif forward_mode.is_draft_extend(include_v2=True):
                     mode_int = 2  # DRAFT_EXTEND
                 else:
                     raise ValueError(f"Unsupported forward_mode: {forward_mode}")
@@ -1219,7 +1267,7 @@ class NativeSparseAttnBackend(
                 metadata.nsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
                 metadata.nsa_cache_seqlens_int32.copy_(precomputed.nsa_cache_seqlens)
 
-            elif forward_mode.is_draft_extend():
+            elif forward_mode.is_draft_extend(include_v2=True):
                 # Draft extend mode
                 rows = precomputed.page_indices.shape[0]
                 cols = precomputed.max_seqlen_k
@@ -1249,6 +1297,37 @@ class NativeSparseAttnBackend(
                 size = precomputed.seqlens_expanded_size
                 flashmla_metadata = metadata.flashmla_metadata.slice(slice(0, size + 1))
                 flashmla_metadata.copy_(precomputed.flashmla_metadata)
+
+        # Refresh DeepGEMM paged MQA schedule metadata for the actual seqlens of
+        # this replay. The captured graph otherwise keeps the capture-time work
+        # decomposition, which can deadlock when runtime sequence lengths differ.
+        if is_cuda():
+            try:
+                import deep_gemm
+
+                if forward_mode.is_decode_or_idle():
+                    seqlens_32 = metadata.cache_seqlens_int32
+                else:
+                    # CUDA graphs capture the fixed query capacity. Keep the
+                    # DeepGEMM context tensor at that shape on every replay.
+                    seqlens_32 = metadata.nsa_seqlens_expanded
+                seqlens_32_2d = _to_2d_context_lens(seqlens_32)
+                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32_2d, 64, deep_gemm.get_num_sms()
+                )
+                if metadata.paged_mqa_schedule_metadata is None:
+                    object.__setattr__(
+                        metadata, "paged_mqa_schedule_metadata", new_schedule
+                    )
+                else:
+                    # Preserve the data_ptr captured by the CUDA graph.
+                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                if metadata.paged_mqa_ctx_lens_2d is None:
+                    object.__setattr__(metadata, "paged_mqa_ctx_lens_2d", seqlens_32_2d)
+                else:
+                    metadata.paged_mqa_ctx_lens_2d.copy_(seqlens_32_2d)
+            except (ImportError, ModuleNotFoundError):
+                pass
 
         self.forward_metadata = metadata
 
@@ -1399,15 +1478,38 @@ class NativeSparseAttnBackend(
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
 
-            if topk_transform_method == TopkTransformMethod.RAGGED:
+            if (
+                self.nsa_kv_cache_store_nvfp4
+                and topk_transform_method == TopkTransformMethod.PAGED
+            ):
+                # Speculative/verify-style extend modes use physical indices.
+                # Materialize only those rows and remap them before entering
+                # the BF16 sparse kernel; the raw 416-byte cache is not a
+                # valid FlashMLA sparse input.
+                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
+                    kv_cache=kv_cache,
+                    page_table=page_table_1,
+                    layer_id=layer.layer_id,
+                    token_to_kv_pool=forward_batch.token_to_kv_pool,
+                )
+            elif topk_transform_method == TopkTransformMethod.RAGGED:
                 if any(forward_batch.extend_prefix_lens_cpu):
                     page_table_1_flattened = (
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if self.nsa_kv_cache_store_nvfp4:
+                        kv_cache = dequantize_nvfp4_k_cache_paged(
+                            kv_cache,
+                            page_table_1_flattened,
+                            forward_batch.token_to_kv_pool.get_mla_kv_global_scale(
+                                layer.layer_id
+                            ),
+                        )
+                    else:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
                 page_table_1 = topk_indices
@@ -1425,6 +1527,13 @@ class NativeSparseAttnBackend(
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
+                kv_global_scale=(
+                    forward_batch.token_to_kv_pool.get_mla_kv_global_scale(
+                        layer.layer_id
+                    )
+                    if self.nsa_kv_cache_store_nvfp4
+                    else None
+                ),
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 # TODO optimize args
@@ -1433,6 +1542,13 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
             )
         elif nsa_impl == "fa3":
+            if self.nsa_kv_cache_store_nvfp4:
+                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
+                    kv_cache=kv_cache,
+                    page_table=page_table_1,
+                    layer_id=layer.layer_id,
+                    token_to_kv_pool=forward_batch.token_to_kv_pool,
+                )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -1562,6 +1678,13 @@ class NativeSparseAttnBackend(
             return self._forward_flashmla_kv(
                 q_all=q_all,
                 kv_cache=kv_cache,
+                kv_global_scale=(
+                    forward_batch.token_to_kv_pool.get_mla_kv_global_scale(
+                        layer.layer_id
+                    )
+                    if self.nsa_kv_cache_store_nvfp4
+                    else None
+                ),
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
                 # TODO optimize args
@@ -1580,6 +1703,13 @@ class NativeSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
             )
         elif self.nsa_decode_impl == "fa3":
+            if self.nsa_kv_cache_store_nvfp4:
+                kv_cache, page_table_1 = self._prepare_nvfp4_paged_fallback(
+                    kv_cache=kv_cache,
+                    page_table=page_table_1,
+                    layer_id=layer.layer_id,
+                    token_to_kv_pool=forward_batch.token_to_kv_pool,
+                )
             return self._forward_fa3(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
@@ -1608,6 +1738,45 @@ class NativeSparseAttnBackend(
 
         else:
             assert False, f"Unsupported {self.nsa_decode_impl = }"
+
+    def _prepare_nvfp4_paged_fallback(
+        self,
+        kv_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        layer_id: int,
+        token_to_kv_pool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Materialize selected NVFP4 rows for BF16 paged correctness paths.
+
+        This intentionally allocates a BF16 workspace and must not be used by the
+        final native NVFP4 decode path.  Each physical cache index is mapped to the
+        corresponding row in the compact workspace; negative and positive
+        out-of-capacity entries remain invalid in the remapped page table.
+        """
+
+        physical_indices = page_table.contiguous().view(-1)
+        dequantized_kv = dequantize_nvfp4_k_cache_paged(
+            kv_cache,
+            physical_indices,
+            token_to_kv_pool.get_mla_kv_global_scale(layer_id),
+        )
+
+        # Keep this temporary in the same CUDA-graph memory pool as the
+        # dequantized workspace.  Reusing the backend's growable arange buffer
+        # would invalidate earlier captured graphs when a later, larger batch
+        # replaces that buffer.
+        local_indices = torch.arange(
+            physical_indices.numel(),
+            dtype=torch.int32,
+            device=physical_indices.device,
+        ).view(page_table.shape)
+        valid_indices = (page_table >= 0) & (page_table < kv_cache.shape[0])
+        local_page_table = torch.where(
+            valid_indices,
+            local_indices,
+            torch.full_like(local_indices, -1),
+        )
+        return dequantized_kv, local_page_table
 
     def _forward_fa3(
         self,
@@ -1700,14 +1869,13 @@ class NativeSparseAttnBackend(
         self,
         q_all: torch.Tensor,
         kv_cache: torch.Tensor,
+        kv_global_scale: Optional[torch.Tensor],
         v_head_dim: int,
         sm_scale: float,
         layer,
         metadata: NSAMetadata,
         page_table_1,
     ) -> torch.Tensor:
-        from sgl_kernel.flash_mla import flash_mla_with_kvcache
-
         cache_seqlens = metadata.nsa_cache_seqlens_int32
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
@@ -1715,7 +1883,9 @@ class NativeSparseAttnBackend(
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.nsa_kv_cache_store_fp8:
+        if self.nsa_kv_cache_store_nvfp4:
+            assert kv_global_scale is not None
+        elif not self.nsa_kv_cache_store_fp8:
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
@@ -1724,21 +1894,38 @@ class NativeSparseAttnBackend(
             indices.shape[-1] == self.nsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
-        o, _ = flash_mla_with_kvcache(
-            q=q_all,
-            k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
-            num_splits=metadata.flashmla_metadata.num_splits,
-            softmax_scale=sm_scale,
-            indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
-            is_fp8_kvcache=True,
-        )
+        if self.nsa_kv_cache_store_nvfp4:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache_nvfp4
+
+            o, _ = flash_mla_with_kvcache_nvfp4(
+                q=q_all,
+                k_cache=kv_cache,
+                kv_global_scale=kv_global_scale,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+            )
+        else:
+            from sgl_kernel.flash_mla import flash_mla_with_kvcache
+
+            o, _ = flash_mla_with_kvcache(
+                q=q_all,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=metadata.flashmla_metadata.flashmla_metadata,
+                num_splits=metadata.flashmla_metadata.num_splits,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                ),
+                is_fp8_kvcache=True,
+            )
         return o
 
     def _forward_standard_mha(
@@ -2113,14 +2300,26 @@ class NativeSparseAttnBackend(
         SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
-        if (
-            # disable for MTP
+        if self.nsa_kv_cache_store_nvfp4 and self.nsa_prefill_impl == "flashmla_sparse":
+            topk_transform_method = TopkTransformMethod.RAGGED
+
+            # The ragged transform is valid only for ordinary prefill, where the
+            # selected indices are offset into the compact dequantized prefix.
+            # Decode and speculative modes materialize the selected physical rows
+            # directly and therefore require a paged table.
+            if (
+                forward_mode is not None
+                and not forward_mode.is_extend_without_speculative()
+            ):
+                topk_transform_method = TopkTransformMethod.PAGED
+        elif (
+            # Keep the existing FP8/MTP dispatch unchanged.
             self.nsa_kv_cache_store_fp8
             and self.nsa_prefill_impl == "flashmla_sparse"
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
 
-            if forward_mode is not None and (forward_mode.is_decode_or_idle()):
+            if forward_mode is not None and forward_mode.is_decode_or_idle():
                 topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED
@@ -2139,6 +2338,7 @@ class NativeSparseAttnBackend(
                 forward_batch.forward_mode
             ),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+            paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
         )
 
@@ -2322,6 +2522,26 @@ class NativeSparseAttnMultiStepBackend:
                         precomputed.max_len,
                         precomputed.seqlens_expanded_size,
                     )
+
+                    # The fused copier updates the ordinary NSA tensors only.
+                    # Refresh the graph-captured DeepGEMM planner/context
+                    # buffers for the first three backends as well.
+                    import deep_gemm
+
+                    context_lens_2d = _to_2d_context_lens(precomputed.cache_seqlens)
+                    schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                        context_lens_2d, 64, deep_gemm.get_num_sms()
+                    )
+                    for backend, metadata in zip(
+                        self.attn_backends[:3],
+                        (metadata0, metadata1, metadata2),
+                        strict=True,
+                    ):
+                        assert metadata.paged_mqa_schedule_metadata is not None
+                        assert metadata.paged_mqa_ctx_lens_2d is not None
+                        metadata.paged_mqa_schedule_metadata.copy_(schedule_metadata)
+                        metadata.paged_mqa_ctx_lens_2d.copy_(context_lens_2d)
+                        backend.forward_metadata = metadata
 
                     # Copy remaining backends one by one (if > 3 backends)
                     for i in range(3, self.speculative_num_steps - 1):

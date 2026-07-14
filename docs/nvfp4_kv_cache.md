@@ -1,10 +1,16 @@
 # NVFP4 KV Cache on SM120 (Blackwell)
 
+This page describes the general SM120 MHA path. The separate experimental
+[GLM-5.2 SM90 NSA guide](./basic_usage/glm52_nvfp4_sm90.md) documents a fixed
+latent-cache layout and a native FlashMLA decode kernel; its build, launch
+arguments, and limitations are different from the SM120 flow below.
+
 NVFP4 KV cache uses FP4 (E2M1) format with two-level scaling (per-tensor FP32 + per-block FP8 E4M3) to compress the KV cache on Blackwell GPUs. This reduces KV cache memory by ~2x compared to FP8, enabling longer context or higher throughput.
 
 ## Supported Hardware
 
-NVFP4 KV cache requires SM120 architecture.
+The general path on this page requires SM120. The GLM-5.2 NSA path described in
+the linked guide supports SM90.
 
 ## Installation
 
@@ -17,11 +23,13 @@ NVFP4 KV cache requires SM120 architecture.
 
 ### Install SGLang
 
-NVFP4 KV cache support is on the `nvfp4-kvcache-sm120-v2` branch. Clone from the fork and install in editable mode:
+Check out the delivery branch that contains NVFP4 KV cache support and install
+it in editable mode:
 
 ```bash
-git clone -b nvfp4-kvcache-sm120-v2 https://github.com/samuellees/sglang.git
+git clone --recursive <delivery-repository-url> sglang
 cd sglang
+git checkout <delivery-branch>
 pip install -e "python[all]"
 ```
 
@@ -215,7 +223,8 @@ These scales are stored in `kv_cache_sf` (scale factor) tensors alongside the FP
 
 ## Known Limitations
 
-- NVFP4 KV cache is SM120 only (not SM90/SM100)
+- The general MHA path documented on this page is SM120 only. The separate
+  GLM-5.2 NSA implementation supports its fixed latent-cache shape on SM90.
 - The TRT-LLM context kernel does not support NVFP4 scales, so MTP must use `--speculative-attention-mode decode`
 - FlashInfer prefill with NVFP4 dequantizes to FP8, not native FP4 prefill
 - Radix cache must be disabled (`--disable-radix-cache`)

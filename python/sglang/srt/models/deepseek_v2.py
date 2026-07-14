@@ -128,6 +128,9 @@ from sglang.srt.models.deepseek_common.attention_forward_methods import (
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
 )
+from sglang.srt.models.deepseek_common.index_cache import (
+    get_nsa_index_cache_policy,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _device_sm,
     _get_llama_4_scaling,
@@ -1098,6 +1101,7 @@ class DeepseekV2AttentionMLA(
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
         skip_rope: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1109,6 +1113,7 @@ class DeepseekV2AttentionMLA(
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.quant_config = quant_config
+        self.is_nextn = is_nextn
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         self.use_nsa = is_deepseek_nsa(config)
@@ -1167,6 +1172,8 @@ class DeepseekV2AttentionMLA(
                 prefix=add_prefix("kv_a_proj_with_mqa", prefix),
             )
 
+        self.skip_topk = None
+        self.next_skip_topk = None
         if self.use_nsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
@@ -1186,6 +1193,11 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 layer_id=layer_id,
                 alt_stream=alt_stream,
+            )
+            # A shared layer reuses the preceding computed topk. next_skip_topk
+            # tells the current layer whether that result must be carried on.
+            self.skip_topk, self.next_skip_topk = get_nsa_index_cache_policy(
+                config, layer_id, is_nextn
             )
 
         self.kv_b_proj = ColumnParallelLinear(
@@ -1318,8 +1330,12 @@ class DeepseekV2AttentionMLA(
         )
 
     def op_core(self, state):
-        state.hidden_states_after_attn = self.forward_core(
-            state.pop("attn_intermediate_state")
+        result = self.forward_core(state.pop("attn_intermediate_state"))
+        # TBO does not carry indexer topk between layer ops. Server argument
+        # validation rejects TBO with index sharing, so only the tensor output
+        # is needed here.
+        state.hidden_states_after_attn = (
+            result[0] if isinstance(result, tuple) else result
         )
 
     def forward(
@@ -1330,6 +1346,7 @@ class DeepseekV2AttentionMLA(
         zero_allocator: BumpAllocator,
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         s = self.forward_prepare(
             positions=positions,
@@ -1338,6 +1355,7 @@ class DeepseekV2AttentionMLA(
             zero_allocator=zero_allocator,
             layer_scatter_modes=layer_scatter_modes,
             llama_4_scaling=llama_4_scaling,
+            prev_topk_indices=prev_topk_indices,
         )
         return self.forward_core(s)
 
@@ -1349,6 +1367,7 @@ class DeepseekV2AttentionMLA(
         zero_allocator: BumpAllocator,
         layer_scatter_modes: LayerScatterModes = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
     ):
         if self.attn_mha.kv_b_proj is None:
             self.attn_mha.kv_b_proj = self.kv_b_proj
@@ -1388,7 +1407,12 @@ class DeepseekV2AttentionMLA(
             )
         elif attn_forward_method == AttnForwardMethod.MLA:
             inner_state = self.forward_absorb_prepare(
-                positions, hidden_states, forward_batch, zero_allocator, llama_4_scaling
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
             )
         elif attn_forward_method == AttnForwardMethod.MLA_FUSED_ROPE_ROCM:
             inner_state = self.forward_absorb_fused_mla_rope_prepare(
@@ -1549,6 +1573,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             reduce_results=False,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            is_nextn=is_nextn,
         )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -1635,7 +1660,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Union[
+        Tuple[torch.Tensor, Optional[torch.Tensor]],
+        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor],
+    ]:
         quant_format = (
             "mxfp4"
             if (
@@ -1677,7 +1706,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             zero_allocator=zero_allocator,
             llama_4_scaling=llama_4_scaling,
             layer_scatter_modes=self.layer_scatter_modes,
+            prev_topk_indices=prev_topk_indices,
         )
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = None
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
@@ -1713,7 +1747,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        return hidden_states, residual
+        if topk_indices is None:
+            return hidden_states, residual
+        return hidden_states, residual, topk_indices
 
     def op_comm_prepare_attn(
         self,
@@ -1990,6 +2026,7 @@ class DeepseekV2Model(nn.Module):
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = []
+        topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
@@ -2007,7 +2044,7 @@ class DeepseekV2Model(nn.Module):
                     else:
                         aux_hidden_states.append(hidden_states + residual)
                 layer = self.layers[i]
-                hidden_states, residual = layer(
+                layer_output = layer(
                     positions,
                     hidden_states,
                     forward_batch,
@@ -2015,7 +2052,13 @@ class DeepseekV2Model(nn.Module):
                     zero_allocator,
                     gemm_output_zero_allocator,
                     llama_4_scaling,
+                    prev_topk_indices=topk_indices,
                 )
+                if len(layer_output) == 3:
+                    hidden_states, residual, topk_indices = layer_output
+                else:
+                    hidden_states, residual = layer_output
+                    topk_indices = None
 
         if normal_end_layer != self.end_layer:
             hidden_states, residual = model_forward_maybe_tbo(

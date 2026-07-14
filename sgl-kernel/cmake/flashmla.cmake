@@ -87,6 +87,8 @@ endif()
 
 set(FlashMLA_SOURCES
     "csrc/flashmla_extension.cc"
+    "csrc/flashmla_nvfp4_api.cpp"
+    "csrc/flashmla/sm90/sparse_nvfp4/splitkv_mla.cu"
     ${repo-flashmla_SOURCE_DIR}/csrc/python_api.cpp
     ${repo-flashmla_SOURCE_DIR}/csrc/smxx/get_mla_metadata.cu
     ${repo-flashmla_SOURCE_DIR}/csrc/smxx/mla_combine.cu
@@ -105,7 +107,19 @@ set(FlashMLA_SOURCES
 
 Python_add_library(flashmla_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FlashMLA_SOURCES})
 target_compile_options(flashmla_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${FLASHMLA_CUDA_FLAGS}>)
+
+option(
+    SGLANG_FLASHMLA_NVFP4_STAGE_TIMING
+    "Build the benchmark-only SM90 NVFP4 FlashMLA stage-timing operator"
+    OFF
+)
+if(SGLANG_FLASHMLA_NVFP4_STAGE_TIMING)
+    target_compile_definitions(flashmla_ops PRIVATE SGLANG_FLASHMLA_NVFP4_STAGE_TIMING=1)
+    target_compile_options(flashmla_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>)
+endif()
+
 target_include_directories(flashmla_ops PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc
     ${repo-flashmla_SOURCE_DIR}/csrc/sm90
     ${repo-flashmla_SOURCE_DIR}/csrc/extension/sm90/dense_fp8/
